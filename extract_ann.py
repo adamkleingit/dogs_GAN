@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 import xml.etree.ElementTree as ET
-from pandas_profiling import ProfileReport
+# from pandas_profiling import ProfileReport
 
 WIDTH_KEY='width'
 HEIGHT_KEY='height'
@@ -17,6 +17,8 @@ def get_xml_tags(xml_dir):
     df_data = []
     for root,dirs,files in os.walk(xml_dir):
         for f in files:
+            if f.startswith('.'):
+                continue
             xml_path = os.path.join(root,f)
             try:
                 xml_obj = open(xml_path)
@@ -39,7 +41,7 @@ def get_xml_tags(xml_dir):
 
 
 if __name__ == '__main__':
-    xml_dir = r"C:\Users\Axon-Vision\Downloads\guy\Annotation"
+    xml_dir = r"Annotation"
     df= get_xml_tags(xml_dir)
     print('finish')
 
