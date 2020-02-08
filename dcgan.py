@@ -1,5 +1,5 @@
 from __future__ import print_function
-#%matplotlib inline
+# %matplotlib inline
 import argparse
 import os
 import random
@@ -11,23 +11,81 @@ import torch.optim as optim
 import torch.utils.data
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
+from torchsummary import summary
 import torchvision.utils as vutils
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import os
 
-os.environ['KMP_DUPLICATE_LIB_OK']='True'
+# cloned a git repo called over9000 from https://github.com/mgrankin/over9000
+# make the over9000 as source root to prevent import problems
+from over9000.over9000 import RangerLars
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+MODEL_NAME = 'dcgan_model'
+MODEL_EXT = '.pth'
+
+
+def save_ckpt(model, optimizer, save_dir, epoch=None, loss=None):
+    save_dict = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'loss': loss,
+    }
+
+    # composed the model name
+    current_model_name = MODEL_NAME
+    if epoch is not None:
+        current_model_name += '_epoch_%s' % epoch
+
+    # check if the same name already existed in the save directory
+    matched_model_files = [os.path.splitext(n)[0] for n in os.listdir(save_dir) if n.startswith(MODEL_NAME)]
+    if current_model_name in matched_model_files:
+        # change name so we won't override an older checkpoint
+        current_model_name += '_1'
+
+    # save model
+    ckpt_path = os.path.join(save_dir, current_model_name + MODEL_EXT)
+    torch.save(save_dict, ckpt_path)
+
+
+def _load_ckpt(model, optimizer, ckpt_path):
+    checkpoint = torch.load(ckpt_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch = checkpoint['epoch']
+    loss = checkpoint['loss']
+    return model, optimizer, epoch, loss
+
+
+def load_ckpt_for_eval(model, optimizer, ckpt_path):
+    model, optimizer, epoch, loss = _load_ckpt(model, optimizer, ckpt_path)
+    # set to eval mode
+    model.eval()
+    return model, optimizer, epoch, loss
+
+
+def load_ckpt_for_train(model, optimizer, ckpt_path):
+    model, optimizer, epoch, loss = _load_ckpt(model, optimizer, ckpt_path)
+    # set to eval mode
+    model.train()
+    return model, optimizer, epoch, loss
 
 
 # Set random seed for reproducibility
 manualSeed = 999
-#manualSeed = random.randint(1, 10000) # use if you want new results
+# manualSeed = random.randint(1, 10000) # use if you want new results
 print("Random Seed: ", manualSeed)
 random.seed(manualSeed)
 torch.manual_seed(manualSeed)
 # Root directory for dataset
 dataroot = "Images"
+
+ckptroot = 'models'
+g_ckpt_root = os.path.join(ckptroot, 'G')
+d_ckpt_root = os.path.join(ckptroot, 'D')
 
 # Number of workers for dataloader
 workers = 2
@@ -36,23 +94,32 @@ workers = 2
 batch_size = 128
 
 # Spatial size of training images. All images will be resized to this
-#   size using a transformer.
-image_size = 64
+#   size using a transformer. Should be of power of 2!
+image_size = 128
+
+# Number of iterations to save the generator output
+gen_out_sample = 100
+
+# Number of iterations to show the generator output. After showing the output the queue will be empty
+gen_out_flush = 500
 
 # Number of channels in the training images. For color images this is 3
 nc = 3
 
 # Size of z latent vector (i.e. size of generator input)
-nz = 100
+nz = 128
 
 # Size of feature maps in generator
 ngf = 64
 
 # Size of feature maps in discriminator
-ndf = 64
+ndf = 32
 
 # Number of training epochs
-num_epochs = 100
+num_epochs = 1000
+
+# Number of epochs to save the model
+save_epochs = 40
 
 # Learning rate for optimizers
 lr = 0.0002
@@ -77,14 +144,15 @@ dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size,
 # Decide which device we want to run on
 device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0) else "cpu")
 
-
 # Plot some training images
 real_batch = next(iter(dataloader))
-plt.figure(figsize=(8,8))
+plt.figure(figsize=(8, 8))
 plt.axis("off")
 plt.title("Training Images")
-plt.imshow(np.transpose(vutils.make_grid(real_batch[0].to(device)[:64], padding=2, normalize=True).cpu(),(1,2,0)))
+plt.imshow(np.transpose(vutils.make_grid(real_batch[0].to(device)[:64], padding=2, normalize=True).cpu(), (1, 2, 0)))
 plt.show()
+
+
 def weights_init(m):
     classname = m.__class__.__name__
     if classname.find('Conv') != -1:
@@ -93,35 +161,46 @@ def weights_init(m):
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0)
 
+
 class Generator(nn.Module):
     def __init__(self, ngpu):
         super(Generator, self).__init__()
         self.ngpu = ngpu
-        self.main = nn.Sequential(
-            # input is Z, going into a convolution
-            nn.ConvTranspose2d( nz, ngf * 8, 4, 1, 0, bias=False),
-            nn.BatchNorm2d(ngf * 8),
-            nn.ReLU(True),
-            # state size. (ngf*8) x 4 x 4
-            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ngf * 4),
-            nn.ReLU(True),
-            # state size. (ngf*4) x 8 x 8
-            nn.ConvTranspose2d( ngf * 4, ngf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ngf * 2),
-            nn.ReLU(True),
-            # state size. (ngf*2) x 16 x 16
-            nn.ConvTranspose2d( ngf * 2, ngf, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ngf),
-            nn.ReLU(True),
-            # state size. (ngf) x 32 x 32
-            nn.ConvTranspose2d( ngf, nc, 4, 2, 1, bias=False),
+        layers_list = []
+        # compute num of layers from the image size (which should be the output and a power of 2). assuming the input is ZX1X1
+        size_exp = int(np.log2(image_size))
+        num_hidden_layers = size_exp - 2  # exclude the input and output layers
+        # current feature map size multiplier
+        fm = 2**(num_hidden_layers-1)
+
+        for i in range(num_hidden_layers):
+            if i == 0:
+                # insert first hidden layer
+                layers_list.extend([
+                    nn.ConvTranspose2d(nz, ngf * fm, 4, 1, 0, bias=False),
+                    nn.BatchNorm2d(ngf * fm),
+                ])
+            else:
+                layers_list.extend([
+                    nn.ConvTranspose2d(ngf * fm * 2, ngf * fm, 4, 2, 1, bias=False),
+                    nn.BatchNorm2d(ngf * fm)
+                ])
+            # add the activation
+            layers_list.append(nn.ReLU(True))
+            # reduce the multplier by factor of 2
+            fm //= 2
+        # insert last layer
+        layers_list.extend([
+            nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
             nn.Tanh()
-            # state size. (nc) x 64 x 64
-        )
+        ])
+
+        # build the model
+        self.main = nn.Sequential(*layers_list)
 
     def forward(self, input):
         return self.main(input)
+
 
 # Create the generator
 netG = Generator(ngpu).to(device)
@@ -136,34 +215,42 @@ netG.apply(weights_init)
 
 # Print the model
 print(netG)
+summary(netG, (nz, 1, 1))
+
 
 class Discriminator(nn.Module):
     def __init__(self, ngpu):
         super(Discriminator, self).__init__()
         self.ngpu = ngpu
-        self.main = nn.Sequential(
-            # input is (nc) x 64 x 64
-            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf) x 32 x 32
-            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 2),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf*2) x 16 x 16
-            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 4),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf*4) x 8 x 8
-            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 8),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf*8) x 4 x 4
-            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+        layers_list = []
+        size_exp = int(np.log2(image_size))
+        num_hidden_layers = size_exp - 2
+        # current feature map size multiplier
+        fm = 1
+        for i in range(num_hidden_layers):
+            if i==0:
+                layers_list.append(nn.Conv2d(nc, ndf * fm, 4, 2, 1, bias=False))
+            else:
+                layers_list.extend([
+                    nn.Conv2d(ndf * fm // 2, ndf * fm, 4, 2, 1, bias=False),
+                    nn.BatchNorm2d(ndf * fm)
+                ])
+            # add the activation
+            layers_list.append(nn.LeakyReLU(0.2, inplace=True))
+            # increase the multplier by factor of 2
+            fm *= 2
+        # insert last layer
+        layers_list.extend([
+            nn.Conv2d(ndf * fm // 2, 1, 4, 1, 0, bias=False),
             nn.Sigmoid()
-        )
+        ])
+
+        # build the model
+        self.main = nn.Sequential(*layers_list)
 
     def forward(self, input):
         return self.main(input)
+
 
 # Create the Discriminator
 netD = Discriminator(ngpu).to(device)
@@ -178,6 +265,7 @@ netD.apply(weights_init)
 
 # Print the model
 print(netD)
+summary(netD, (nc, image_size, image_size))
 
 # Initialize BCELoss function
 criterion = nn.BCELoss()
@@ -191,9 +279,12 @@ real_label = 1
 fake_label = 0
 
 # Setup Adam optimizers for both G and D
-optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
-optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
+# optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
+# optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
 
+# Setup optimizers for both G and D
+optimizerD = RangerLars(netD.parameters(), lr=lr, betas=(beta1, 0.999))
+optimizerG = RangerLars(netG.parameters(), lr=lr, betas=(beta1, 0.999))
 
 # Training Loop
 
@@ -205,7 +296,14 @@ iters = 0
 
 print("Starting Training Loop...")
 # For each epoch
-for epoch in range(num_epochs):
+for epoch in range(1, num_epochs + 1):
+
+    if epoch % save_epochs == 0:
+        # Save models
+        save_ckpt(netD, optimizerD, d_ckpt_root, epoch)
+        save_ckpt(netG, optimizerG, g_ckpt_root, epoch)
+        print('Save the models for epoch: %d' % epoch)
+
     # For each batch in the dataloader
     for i, data in enumerate(dataloader, 0):
 
@@ -270,24 +368,38 @@ for epoch in range(num_epochs):
         D_losses.append(errD.item())
 
         # Check how the generator is doing by saving G's output on fixed_noise
-        if (iters % 500 == 0) or ((epoch == num_epochs-1) and (i == len(dataloader)-1)):
+        if (iters % gen_out_sample == 0) or ((epoch == num_epochs - 1) and (i == len(dataloader) - 1)):
             with torch.no_grad():
                 fake = netG(fixed_noise).detach().cpu()
             img_list.append(vutils.make_grid(fake, padding=2, normalize=True))
 
+        # Show the progress by ploting the generator output on the fixed niose
+        if iters % gen_out_flush == 0:
+            # %%capture
+            fig = plt.figure(figsize=(8, 8))
+            plt.axis("off")
+            ims = [[plt.imshow(np.transpose(i, (1, 2, 0)), animated=True)] for i in img_list]
+            plt.show()
+            img_list = []
+
         iters += 1
 
-plt.figure(figsize=(10,5))
+plt.figure(figsize=(10, 5))
 plt.title("Generator and Discriminator Loss During Training")
-plt.plot(G_losses,label="G")
-plt.plot(D_losses,label="D")
+plt.plot(G_losses, label="G")
+plt.plot(D_losses, label="D")
 plt.xlabel("iterations")
 plt.ylabel("Loss")
 plt.legend()
 plt.show()
 
-#%%capture
-fig = plt.figure(figsize=(8,8))
+# %%capture
+fig = plt.figure(figsize=(8, 8))
 plt.axis("off")
-ims = [[plt.imshow(np.transpose(i,(1,2,0)), animated=True)] for i in img_list]
+ims = [[plt.imshow(np.transpose(i, (1, 2, 0)), animated=True)] for i in img_list]
 plt.show()
+
+# Save models
+save_ckpt(netD, optimizerD, d_ckpt_root, epoch)
+save_ckpt(netG, optimizerG, g_ckpt_root, epoch)
+print('Save the models for epoch: %d' % epoch)
